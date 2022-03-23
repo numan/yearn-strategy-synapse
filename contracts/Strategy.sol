@@ -56,10 +56,7 @@ contract Strategy is BaseStrategy {
 
 
     constructor(address _vault) public BaseStrategy(_vault) {
-        // You can set these parameters on deployment to whatever you want
-        // maxReportDelay = 6300;
-        // profitFactor = 100;
-        // debtThreshold = 0;
+        minReportDelay = 60 * 60 * 24 * 7; // 7 days
     }
 
     // ******** OVERRIDE THESE METHODS FROM BASE CONTRACT ************
@@ -273,7 +270,6 @@ contract Strategy is BaseStrategy {
         routes[0].from = address(SYN);
         routes[0].to = address(want);
         routes[0].stable = false;
-
         solidlyRouter.swapExactTokensForTokens(
             _amount,
             0,
@@ -430,6 +426,17 @@ contract Strategy is BaseStrategy {
         returns (uint256)
     {
         return nUSD.balanceOf(address(this));
+    }
+
+    function _checkAllowance(
+        address _contract,
+        address _token,
+        uint256 _amount
+    ) internal {
+        if (IERC20(_token).allowance(address(this), _contract) < _amount) {
+            IERC20(_token).safeApprove(_contract, 0);
+            IERC20(_token).safeApprove(_contract, _amount);
+        }
     }
 
 }
