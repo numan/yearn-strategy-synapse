@@ -8,6 +8,7 @@ import {
     BaseStrategy,
     StrategyParams
 } from "@yearnvaults/contracts/BaseStrategy.sol";
+import "@openzeppelin/contracts/math/Math.sol";
 import {
     SafeERC20,
     SafeMath,
@@ -29,12 +30,6 @@ contract Strategy is BaseStrategy {
     using Address for address;
     using SafeMath for uint256;
 
-    struct route {
-        address from;
-        address to;
-        bool stable;
-    }
-
 
     // tokens
     IERC20 internal constant USDT = IERC20(0x049d68029688eAbF473097a2fC38ef61633A3C7A);
@@ -42,21 +37,39 @@ contract Strategy is BaseStrategy {
     IERC20 internal constant SYN = IERC20(0xE55e19Fb4F2D85af758950957714292DAC1e25B2);
 
     // lp tokens
-    IERC20 internal constant syn3PoolLP = IERC20(0x2DC777ff99058a12844A33D9B1AE6c8AB4701F66);
+    IERC20 internal immutable syn3PoolLP;
 
     // staking contracts
-    IMasterChef internal constant synStakingMC = IMasterChef(0xaeD5b25BE1c3163c907a471082640450F928DDFE);
+    IMasterChef internal immutable synStakingMC;
 
     // pools
-    IUniswapV2Router02 internal constant solidlyRouter = IUniswapV2Router02(0xa38cd27185a464914D3046f0AB9d43356B34829D); // Solidly router
-    ISwap internal constant syn3PoolSwap = ISwap(0x85662fd123280827e11C59973Ac9fcBE838dC3B4); // Synapse Fantom 3 Pool
+    ISwap internal immutable syn3PoolSwap; // Synapse Fantom Stable 3 Pool
 
-    uint256 internal constant pid = 3; // Minichef Pool ID
-    uint8 internal constant syn3PoolUSDCTokenIndex = 1; // Index of USDT in Synapse Fantom 3 Pool
+    // router
+    IUniswapV2Router02 internal immutable solidlyRouter;
+
+    uint256 internal immutable pid; // Staking contract Pool ID
+    uint8 internal immutable syn3PoolUSDCTokenIndex; // Index of USDT in Synapse Fantom 3 Pool
 
 
-    constructor(address _vault) public BaseStrategy(_vault) {
+    constructor(
+        address _vault,
+        address _synStable3PoolLP,
+        address _synStable3Pool,
+        address _solidlyRouter,
+        address _synStakingMC,
+        uint256 _stakingContractPoolId,
+        uint8 _synStable3PoolUSDCTokenIndex
+    ) public BaseStrategy(_vault) {
         minReportDelay = 60 * 60 * 24 * 7; // 7 days
+
+        syn3PoolLP = IERC20(_synStable3PoolLP); // FTM Mainnet: 0x2DC777ff99058a12844A33D9B1AE6c8AB4701F66
+        syn3PoolSwap = ISwap(_synStable3Pool); // FTM Mainnet: 0x85662fd123280827e11C59973Ac9fcBE838dC3B4
+        synStakingMC = IMasterChef(_synStakingMC); // FTM Mainnet: 0xaeD5b25BE1c3163c907a471082640450F928DDFE
+        solidlyRouter = IUniswapV2Router02(_solidlyRouter); // FTM Mainnet: 0xa38cd27185a464914D3046f0AB9d43356B34829D
+
+        pid = _stakingContractPoolId; // FTM Mainnet: 3
+        syn3PoolUSDCTokenIndex = _synStable3PoolUSDCTokenIndex; // FTM Mainnet: 1
     }
 
     // ******** OVERRIDE THESE METHODS FROM BASE CONTRACT ************
@@ -157,12 +170,11 @@ contract Strategy is BaseStrategy {
                 //Stake the LP tokens
                 synStakingMC.deposit(
                     pid,
-                    unstakedLPBalance(),
-                    address(this)
+                    unstakedLPBalance()
                 );
             }
 
-            _liquidWant = balanceOfWant();
+            _liquidWant = wantBalance();
         }
 
         if (_amountNeeded > _liquidWant) {
@@ -257,19 +269,24 @@ contract Strategy is BaseStrategy {
         returns (uint256)
     {
     }
+    // ----------------- SUPPORT FUNCTIONS ----------
 
     /**
      * @notice
      *  Takes the amount in `SYN` and sells it for `want` on solidly
      * @dev
      *  Total amount to sell in wei
-     * @return
      **/
     function _sellSynToWant(uint256 _amount) internal {
-        route[] memory routes = new route[](1);
+        IUniswapV2Router02.route[] memory routes = new IUniswapV2Router02.route[](1);
         routes[0].from = address(SYN);
         routes[0].to = address(want);
         routes[0].stable = false;
+
+        // Make sure we have enough allowance to do the swap
+        address pair = solidlyRouter.pairFor(routes[0].from, routes[0].to, routes[0].stable);
+        _checkAllowance(pair, address(SYN), _amount);
+
         solidlyRouter.swapExactTokensForTokens(
             _amount,
             0,
@@ -279,10 +296,10 @@ contract Strategy is BaseStrategy {
         );
     }
 
-    // ----------------- SUPPORT FUNCTIONS ----------
-
-
     function _addliquidity(uint256 _amount) internal {
+        _checkAllowance(address(syn3PoolSwap), address(want), _amount);
+
+
         uint256[] memory liquidityToAdd = new uint256[](3);
         liquidityToAdd[0] = 0; // nUSD
         liquidityToAdd[1] = _amount; // USDC
@@ -290,15 +307,16 @@ contract Strategy is BaseStrategy {
 
         syn3PoolSwap.addLiquidity(
             liquidityToAdd,
-            0, //todo: should be specify a minimum amount here?
+            0, //todo: should be specify a minimum amount here? Could be some loss because of inbalance, 
             block.timestamp
         );
     }
 
     function _unstakeLPTokens(uint256 _amount) internal {
-        lpStaker.withdraw(
+        synStakingMC.withdraw(
             pid,
-            _amount
+            _amount,
+            address(this)
         );
     }
 
@@ -324,12 +342,12 @@ contract Strategy is BaseStrategy {
         view
         returns (uint256) 
     {
-        route[] memory routes = new route[](1);
+        IUniswapV2Router02.route[] memory routes = new IUniswapV2Router02.route[](1);
         routes[0].from = address(SYN);
         routes[0].to = address(want);
         routes[0].stable = false;
 
-        return solidlyRouter.getAmountsOut(totalSYNBalance(), path)[1];
+        return solidlyRouter.getAmountsOut(claimedSynBalance(), routes)[1];
     }
 
     /**
